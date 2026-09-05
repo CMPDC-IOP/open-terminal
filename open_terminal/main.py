@@ -2334,3 +2334,10 @@ if ENABLE_NOTEBOOKS:
     from open_terminal.utils.notebooks import create_notebooks_router
 
     app.include_router(create_notebooks_router(verify_api_key))
+
+
+# Personal file management relies on Linux directory descriptors and renameat2.
+if sys.platform == "linux":
+    from open_terminal.workspace import install_workspace_routes
+
+    install_workspace_routes(app, get_filesystem, verify_api_key)

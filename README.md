@@ -120,6 +120,8 @@ docker run -d --name open-terminal -p 8000:8000 my-terminal
 ```
 
 
+For this fork's Open WebUI personal-file APIs and local image build, see [Personal file management](docs/personal-files.md).
+
 ## Configuration
 
 Open Terminal can be configured via a TOML config file, environment variables, and CLI flags. Settings are resolved in this order (highest priority wins):
