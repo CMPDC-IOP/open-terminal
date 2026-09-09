@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner
 from open_terminal.utils.fs import UserFS
+from open_terminal.utils.file_compare import CompareRequest, run_comparison
 
 MATCH_PAGE_SIZE = 100
 MAX_CONTENT_MATCHES_PER_FILE = 3
@@ -553,6 +554,13 @@ async def list_files(
         raise HTTPException(status_code=404, detail="Directory not found")
     entries = await fs.listdir(target)
     return {"dir": target, "writable": await fs.is_writable(target), "entries": entries}
+
+
+@app.post("/files/compare", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def compare_files(http_request: Request, payload: CompareRequest, fs: UserFS = Depends(get_filesystem)):
+    session_id = http_request.headers.get("x-session-id")
+    cwd = _get_session_cwd(session_id, fs) if session_id else None
+    return await run_comparison(http_request, payload, fs, cwd)
 
 
 @app.get(

@@ -10,25 +10,57 @@ All libraries used are permissively licensed (MIT / BSD).
 import zipfile
 
 
-def extract_pdf(file_path: str) -> str:
+def extract_pdf(file_path: str, strict: bool = False) -> str:
     """Extract text from a PDF file."""
     from pypdf import PdfReader
 
     reader = PdfReader(file_path)
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    if strict and reader.is_encrypted:
+        raise ValueError("Encrypted PDF. Provide an unencrypted copy.")
+    pages = [page.extract_text() or "" for page in reader.pages]
+    missing = [str(i) for i, text in enumerate(pages, 1) if not text.strip()]
+    if strict and missing:
+        raise ValueError(
+            f"No extractable text on PDF pages {', '.join(missing)}. OCR is required before comparison."
+        )
+    return "\n".join(pages)
 
 
 def extract_docx(file_path: str) -> str:
-    """Extract text from a Word (.docx) file."""
+    """Extract current paragraph/table text, including tracked insertions, without saving."""
     from docx import Document as DocxDocument
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    from docx.oxml.ns import qn
+    from lxml import etree
 
     doc = DocxDocument(file_path)
+    body = doc.element.body
+    # Ignore historical properties before finding revisions in the current text.
+    for node in list(body.iter()):
+        if isinstance(node.tag, str) and node.tag.startswith(qn("w:")) and node.tag.endswith("Change"):
+            node.getparent().remove(node)
+    for node in body.xpath(".//w:tr[w:trPr/w:del] | .//w:tc[w:tcPr/w:cellDel]"):
+        node.getparent().remove(node)
+    joined_paragraphs = body.xpath(".//w:p[w:pPr/w:rPr/w:del]")
+    etree.strip_elements(body, qn("w:del"), qn("w:moveFrom"), with_tail=False)
+    etree.strip_tags(body, qn("w:ins"), qn("w:moveTo"))
+    # A deleted paragraph mark joins its text to the following paragraph.
+    for paragraph in reversed(joined_paragraphs):
+        following = paragraph.getnext()
+        if following is not None and following.tag == qn("w:p"):
+            for child in list(following):
+                if child.tag != qn("w:pPr"):
+                    paragraph.append(child)
+            following.getparent().remove(following)
     parts = []
-    for para in doc.paragraphs:
-        parts.append(para.text)
-    for table in doc.tables:
-        for row in table.rows:
-            parts.append("\t".join(cell.text for cell in row.cells))
+    for child in doc.element.body:
+        if child.tag.endswith("}p"):
+            parts.append(Paragraph(child, doc).text)
+        elif child.tag.endswith("}tbl"):
+            for row in Table(child, doc).rows:
+                parts.append("\t".join(cell.text for cell in row.cells))
     return "\n".join(parts)
 
 
@@ -143,7 +175,7 @@ def extract_odp(file_path: str) -> str:
     return "\n".join(parts)
 
 
-def extract_epub(file_path: str) -> str:
+def extract_epub(file_path: str, strict: bool = False) -> str:
     """Extract text from an EPUB e-book."""
     from lxml import etree
 
@@ -182,6 +214,8 @@ def extract_epub(file_path: str) -> str:
                             text = "".join(body.itertext())
                             parts.append(text.strip())
                 except (KeyError, etree.XMLSyntaxError):
+                    if strict:
+                        raise ValueError(f"Could not extract EPUB chapter: {item_path}")
                     continue
         else:
             for name in zf.namelist():
@@ -194,6 +228,8 @@ def extract_epub(file_path: str) -> str:
                                 text = "".join(body.itertext())
                                 parts.append(text.strip())
                     except etree.XMLSyntaxError:
+                        if strict:
+                            raise ValueError(f"Could not extract EPUB chapter: {name}")
                         continue
     return "\n\n".join(parts)
 
