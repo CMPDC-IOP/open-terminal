@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.5] - 2026-09-08
+
+### Added
+
+- Connected apps can now compare two files without changing either original. Results include added and removed lines, line numbers, nearby text, and highlights of changed words.
+- File comparison supports plain text, PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB books, and saved email messages. It compares readable text and cell values, with notices explaining which content is left out, such as formatting, images, formulas, and attachments.
+- Comparisons can ignore differences in spaces and tabs. Relative file names are resolved from the current terminal session's folder.
+- Comparisons report encrypted PDFs, PDF pages with no readable text, and EPUB chapters that cannot be read. Files over 50 MiB or text over 2 million characters or 50,000 lines are rejected instead of returning a partial comparison. Comparisons stop after 60 seconds or when the connection closes.
+
+### Fixed
+
+- Reading Word files now keeps paragraphs and tables in their original order instead of moving all tables to the end.
+- Reading Word files now includes tracked insertions and excludes tracked deletions, including deleted table rows and cells. Moved text appears in its new location, and deleting a paragraph break joins the surrounding text. The original file is unchanged.
+
+### Changed
+
+- Added automatic publishing to PyPI when a new version reaches the main branch. Versions already available on PyPI are skipped.
+
 ## [0.12.4] - 2026-09-06
 
 ### Added
