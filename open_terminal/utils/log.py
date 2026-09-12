@@ -167,18 +167,25 @@ async def log_process(background_process) -> None:
         log_rotated = writer.rotated if writer else False
         exit_code = await background_process.runner.wait()
         background_process.exit_code = exit_code
-        background_process.runner.close()
+        from open_terminal import execution
+
+        if execution.enabled():
+            await execution.async_call(background_process.runner.close)
+        else:
+            background_process.runner.close()
+        execution_info = background_process.runner.execution_info
         if writer:
+            end_record = {
+                "type": "end",
+                "exit_code": background_process.exit_code,
+                "log_rotated": log_rotated,
+                "ts": time.time(),
+            }
+            if execution_info:
+                end_record["execution"] = execution_info
+                end_record["end_reason"] = execution_info.get("end_reason")
             await writer.write(
-                json.dumps(
-                    {
-                        "type": "end",
-                        "exit_code": background_process.exit_code,
-                        "log_rotated": log_rotated,
-                        "ts": time.time(),
-                    }
-                )
-                + "\n"
+                json.dumps(end_record) + "\n"
             )
             await writer.flush()
             await writer._file.close()

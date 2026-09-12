@@ -11,6 +11,7 @@ import aiofiles.os
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -28,7 +30,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
+from open_terminal import execution as execution_runtime
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner
+from open_terminal.utils.compute_environment import (
+    compute_thread_environment,
+    with_compute_thread_defaults,
+)
+from open_terminal.utils.service_processes import HelpersBusy, run_helper
 from open_terminal.utils.fs import UserFS
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
 
@@ -145,6 +153,8 @@ def get_filesystem(request: Request) -> UserFS:
     returns a ``UserFS`` that routes all I/O through ``sudo -u``.
     Otherwise returns a plain ``UserFS`` using stdlib.
     """
+    if execution_runtime.enabled() and (not MULTI_USER or not request.headers.get("x-user-id", "").strip()):
+        raise HTTPException(status_code=403, detail="X-User-Id is required")
     if not MULTI_USER:
         return UserFS()
     user_id = request.headers.get("x-user-id")
@@ -173,7 +183,7 @@ def get_file_browser_root(fs: UserFS) -> dict[str, str] | None:
     return {"path": root_path, "label": label}
 
 
-def _preview_pdf(target: str) -> bytes | None:
+def _preview_pdf(target: str, username: str | None = None) -> bytes | None:
     libreoffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not libreoffice:
         return None
@@ -192,7 +202,13 @@ def _preview_pdf(target: str) -> bytes | None:
             tmpdir,
             target,
         ]
-        subprocess.run(command, check=True, capture_output=True, timeout=60)
+        if execution_runtime.enabled():
+            if not username:
+                raise PermissionError("Isolated user is required")
+            import pwd
+            os.chown(tmpdir, pwd.getpwnam(username).pw_uid, -1)
+        run_helper(command, check=True, capture_output=True, timeout=60,
+                   **({"user": username} if execution_runtime.enabled() else {}))
         pdf_path = os.path.join(tmpdir, f"{os.path.splitext(os.path.basename(target))[0]}.pdf")
         if not os.path.isfile(pdf_path):
             matches = [name for name in os.listdir(tmpdir) if name.lower().endswith(".pdf")]
@@ -204,7 +220,17 @@ def _preview_pdf(target: str) -> bytes | None:
             return f.read()
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await execution_runtime.async_call(execution_runtime.initialize)
+    try:
+        yield
+    finally:
+        await execution_runtime.async_call(execution_runtime.shutdown)
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Open Terminal",
     description="A remote terminal API.",
     version=_pkg_version("open-terminal"),
@@ -426,6 +452,20 @@ def _get_process(process_id: str, request: Request) -> BackgroundProcess:
     ):
         raise HTTPException(status_code=404, detail="Process not found")
     return background_process
+
+
+def _process_response(background_process: BackgroundProcess) -> dict:
+    """Build the shared command response with optional managed metadata."""
+    response = {
+        "id": background_process.id,
+        "command": background_process.command,
+        "status": background_process.status,
+        "exit_code": background_process.exit_code,
+        "log_path": background_process.log_path,
+    }
+    if execution := background_process.runner.execution_info:
+        response["execution"] = execution
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +730,9 @@ async def view_file(
         ext = os.path.splitext(target)[1].lower()
         if ext in (".docx", ".pptx"):
             try:
-                pdf = await asyncio.to_thread(_preview_pdf, target)
+                pdf = await asyncio.to_thread(_preview_pdf, target, fs.username)
+            except HelpersBusy:
+                raise
             except Exception:
                 log.exception("Rendered preview failed for %s", target)
                 pdf = None
@@ -1023,10 +1065,11 @@ async def match_files(
 
         def walk_entries() -> list[tuple[str, str]]:
             try:
-                git_result = subprocess.run(
+                git_result = run_helper(
                     ["git", "-C", target, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
                     check=False,
                     capture_output=True,
+                    **({"user": fs.username} if execution_runtime.enabled() else {}),
                 )
             except OSError:
                 git_result = None
@@ -1092,7 +1135,8 @@ async def match_files(
                 args.append("--hidden")
             args.extend(("--", query, target))
             try:
-                completed = subprocess.run(args, capture_output=True, text=True, check=False)
+                completed = run_helper(args, capture_output=True, text=True, check=False,
+                                       **({"user": fs.username} if execution_runtime.enabled() else {}))
             except OSError:
                 return None
             if completed.returncode not in (0, 1):
@@ -1235,10 +1279,11 @@ async def search_files(
         seen = set()
 
         try:
-            git_result = subprocess.run(
+            git_result = run_helper(
                 ["git", "-C", target, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
                 check=False,
                 capture_output=True,
+                **({"user": fs.username} if execution_runtime.enabled() else {}),
             )
         except OSError:
             git_result = None
@@ -1558,13 +1603,7 @@ async def archive_paths(
 async def list_processes(http_request: Request):
     _cleanup_expired()
     return [
-        {
-            "id": background_process.id,
-            "command": background_process.command,
-            "status": background_process.status,
-            "exit_code": background_process.exit_code,
-            "log_path": background_process.log_path,
-        }
+        _process_response(background_process)
         for background_process in _processes.values()
         if background_process.user_id == http_request.headers.get("x-user-id", "")
         and background_process.session_id == http_request.headers.get("x-session-id", "")
@@ -1596,15 +1635,26 @@ async def execute(
         ge=1,
     ),
 ):
+    if execution_runtime.enabled() and not http_request.headers.get("x-user-id", "").strip():
+        raise HTTPException(status_code=403, detail="X-User-Id is required")
     fs = get_filesystem(http_request)
     session_id = http_request.headers.get("x-session-id")
     session_cwd = _get_session_cwd(session_id, fs) if session_id else None
     cwd = fs.resolve_path(request.cwd, cwd=session_cwd) if request.cwd else (session_cwd or fs.home)
 
-    subprocess_env = {**os.environ, **request.env} if request.env else None
-    runner = await create_runner(
-        request.command, cwd, subprocess_env, run_as_user=fs.username
+    subprocess_env = with_compute_thread_defaults(
+        (request.env or {}) if execution_runtime.enabled() else ({**os.environ, **request.env} if request.env else None)
     )
+
+    with execution_runtime.queue_request(http_request):
+        runner = await create_runner(
+            request.command,
+            cwd,
+            subprocess_env,
+            run_as_user=fs.username,
+            user_env=request.env,
+            owner=http_request.headers.get("x-user-id"),
+        )
 
     process_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")
@@ -1630,16 +1680,13 @@ async def execute(
         background_process.log_path, offset=0, tail=tail
     )
 
-    return {
-        "id": process_id,
-        "command": request.command,
-        "status": background_process.status,
-        "exit_code": background_process.exit_code,
+    response = _process_response(background_process)
+    response.update({
         "output": output,
         "truncated": truncated,
         "next_offset": next_offset,
-        "log_path": background_process.log_path,
-    }
+    })
+    return response
 
 
 @app.get(
@@ -1689,16 +1736,13 @@ async def get_status(
         background_process.log_path, offset=offset, tail=tail
     )
 
-    return {
-        "id": background_process.id,
-        "command": background_process.command,
-        "status": background_process.status,
-        "exit_code": background_process.exit_code,
+    response = _process_response(background_process)
+    response.update({
         "output": output,
         "truncated": truncated,
         "next_offset": next_offset,
-        "log_path": background_process.log_path,
-    }
+    })
+    return response
 
 
 @app.post(
@@ -1751,9 +1795,15 @@ async def kill_process(
     background_process = _get_process(process_id, http_request)
     if background_process.status == "running":
         background_process.status = "killed"
-        background_process.runner.kill(force=force)
+        if execution_runtime.enabled():
+            await execution_runtime.async_call(background_process.runner.kill, force=force)
+        else:
+            background_process.runner.kill(force=force)
         exit_code = await background_process.runner.wait()
-        background_process.runner.close()
+        if execution_runtime.enabled():
+            await execution_runtime.async_call(background_process.runner.close)
+        else:
+            background_process.runner.close()
         background_process.status = "killed"
         background_process.exit_code = exit_code
     background_process.finished_at = time.time()
@@ -1913,7 +1963,7 @@ if ENABLE_TERMINAL:
     _terminal_sessions: dict[str, dict] = {}
 
 
-    def _cleanup_session(session_id: str):
+    def _cleanup_session(session_id: str, *, reason: str = "completed"):
         """Clean up a terminal session's resources.
 
         For PTY sessions the shell is spawned with ``start_new_session=True``,
@@ -1934,7 +1984,9 @@ if ENABLE_TERMINAL:
                 pass
 
             process = session["process"]
-            if process.poll() is None:
+            if execution_runtime.enabled():
+                execution_runtime.stop(process, reason=reason)
+            elif process.poll() is None:
                 # Signal the whole process group first (graceful).
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
@@ -1965,13 +2017,19 @@ if ENABLE_TERMINAL:
                 status_code=503,
             )
 
+        if execution_runtime.enabled():
+            if not request.headers.get("x-user-id", "").strip():
+                raise HTTPException(status_code=403, detail="X-User-Id is required")
+            if _TERMINAL_BACKEND != "pty":
+                raise HTTPException(status_code=503, detail="Hard execution requires Unix PTY")
+
         # Prune dead sessions before checking limit
         if _TERMINAL_BACKEND == "pty":
-            dead = [sid for sid, s in _terminal_sessions.items() if s["process"].poll() is not None]
+            dead = [sid for sid, s in list(_terminal_sessions.items()) if s["process"].poll() is not None]
         else:
-            dead = [sid for sid, s in _terminal_sessions.items() if not s["pty_process"].isalive()]
+            dead = [sid for sid, s in list(_terminal_sessions.items()) if not s["pty_process"].isalive()]
         for sid in dead:
-            _cleanup_session(sid)
+            await execution_runtime.async_call(_cleanup_session, sid)
 
         if len(_terminal_sessions) >= MAX_TERMINAL_SESSIONS:
             return JSONResponse(
@@ -1999,29 +2057,61 @@ if ENABLE_TERMINAL:
                 chat_id = request.headers.get("x-session-id")
                 session_cwd = _get_session_cwd(chat_id, fs) if chat_id else None
 
-                if fs.username:
+                if execution_runtime.enabled():
+                    if not fs.username:
+                        raise HTTPException(status_code=403, detail="Isolated user is required")
+                    shell_cmd = ["/bin/bash", "-il"]
+                    cwd = session_cwd or fs.home
+                elif fs.username:
+                    shell_environment = compute_thread_environment()
+                    working_directory = session_cwd or fs.home
                     shell_cmd = [
-                        "script", "-qc",
-                        f"sudo -i -u {fs.username}",
+                        "script",
+                        "-qc",
+                        shlex.join(
+                            [
+                                "sudo",
+                                "-H",
+                                "-u",
+                                fs.username,
+                                "--",
+                                "env",
+                                *[
+                                    f"{key}={value}"
+                                    for key, value in shell_environment.items()
+                                ],
+                                "/bin/sh",
+                                "-c",
+                                'cd -- "$1" || exit 1; exec bash -il',
+                                "open-terminal-shell",
+                                working_directory,
+                            ]
+                        ),
                         "/dev/null",
                     ]
-                    cwd = session_cwd or fs.home
+                    cwd = None  # Enter the user directory only after sudo drops identity.
                 else:
                     shell_cmd = [os.environ.get("SHELL", "/bin/sh")]
                     cwd = session_cwd or os.getcwd()
 
-                spawn_env = os.environ.copy()
+                spawn_env = with_compute_thread_defaults({} if execution_runtime.enabled() else None)
                 spawn_env.setdefault("TERM", TERMINAL_TERM)
-                process = subprocess.Popen(
-                    shell_cmd,
-                    stdin=slave_fd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    cwd=cwd,
-                    env=spawn_env,
-                    start_new_session=True,
-                )
-            except Exception:
+                if execution_runtime.enabled():
+                    with execution_runtime.queue_request(request):
+                        process = await execution_runtime.spawn_async(
+                            request.headers["x-user-id"],
+                            fs.username,
+                            shell_cmd,
+                            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                            cwd=cwd,
+                            env=spawn_env,
+                        )
+                else:
+                    process = subprocess.Popen(
+                        shell_cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                        cwd=cwd, env=spawn_env, start_new_session=True,
+                    )
+            except BaseException:
                 os.close(slave_fd)
                 os.close(master_fd)
                 raise
@@ -2041,7 +2131,7 @@ if ENABLE_TERMINAL:
 
         else:  # winpty
             shell = os.environ.get("COMSPEC", "cmd.exe")
-            spawn_env = os.environ.copy()
+            spawn_env = with_compute_thread_defaults()
             spawn_env.setdefault("TERM", TERMINAL_TERM)
             pty_proc = _WinPtyProcess.spawn(
                 [shell],
@@ -2064,11 +2154,7 @@ if ENABLE_TERMINAL:
             connected=False,
             input_lock=asyncio.Lock(),
         )
-        return {
-            "id": session_id,
-            "created_at": session["created_at"],
-            "pid": session["pid"],
-        }
+        return _terminal_response(session_id, session)
 
 
     def _session_is_alive(session: dict) -> bool:
@@ -2077,6 +2163,23 @@ if ENABLE_TERMINAL:
             return session["process"].poll() is None
         else:
             return session["pty_process"].isalive()
+
+
+    def _terminal_execution_metadata(session: dict) -> dict | None:
+        if not execution_runtime.enabled() or session["backend"] != "pty":
+            return None
+        return execution_runtime.describe(session["process"])
+
+
+    def _terminal_response(session_id: str, session: dict) -> dict:
+        response = {
+            "id": session_id,
+            "created_at": session["created_at"],
+            "pid": session["pid"],
+        }
+        if execution := _terminal_execution_metadata(session):
+            response["execution"] = execution
+        return response
 
 
     def _owns_terminal(session: dict, request) -> bool:
@@ -2138,13 +2241,9 @@ if ENABLE_TERMINAL:
             if not _session_is_alive(session):
                 to_remove.append(sid)
                 continue
-            result.append({
-                "id": sid,
-                "created_at": session["created_at"],
-                "pid": session["pid"],
-            })
+            result.append(_terminal_response(sid, session))
         for sid in to_remove:
-            _cleanup_session(sid)
+            await execution_runtime.async_call(_cleanup_session, sid)
         return result
 
 
@@ -2155,13 +2254,9 @@ if ENABLE_TERMINAL:
         if session is None or not _owns_terminal(session, request):
             return JSONResponse({"error": "Session not found"}, status_code=404)
         if not _session_is_alive(session):
-            _cleanup_session(session_id)
+            await execution_runtime.async_call(_cleanup_session, session_id)
             return JSONResponse({"error": "Session not found"}, status_code=404)
-        return {
-            "id": session_id,
-            "created_at": session["created_at"],
-            "pid": session["pid"],
-        }
+        return _terminal_response(session_id, session)
 
 
     @app.delete("/api/terminals/{session_id}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
@@ -2169,7 +2264,9 @@ if ENABLE_TERMINAL:
         """Kill and remove a terminal session."""
         if session_id not in _terminal_sessions or not _owns_terminal(_terminal_sessions[session_id], request):
             return JSONResponse({"error": "Session not found"}, status_code=404)
-        _cleanup_session(session_id)
+        await execution_runtime.async_call(
+            _cleanup_session, session_id, reason="cancelled"
+        )
         return {"status": "deleted"}
 
 
@@ -2196,7 +2293,7 @@ if ENABLE_TERMINAL:
             return
 
         if not _session_is_alive(session):
-            _cleanup_session(session_id)
+            await execution_runtime.async_call(_cleanup_session, session_id)
             await ws.close(code=4004, reason="Session has ended")
             return
 
@@ -2323,7 +2420,7 @@ if ENABLE_TERMINAL:
             except (asyncio.CancelledError, Exception):
                 pass
             # Clean up session on disconnect
-            _cleanup_session(session_id)
+            await execution_runtime.async_call(_cleanup_session, session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2333,7 +2430,7 @@ if ENABLE_TERMINAL:
 if ENABLE_NOTEBOOKS:
     from open_terminal.utils.notebooks import create_notebooks_router
 
-    app.include_router(create_notebooks_router(verify_api_key))
+    app.include_router(create_notebooks_router(verify_api_key, get_filesystem, multi_user=MULTI_USER))
 
 
 # Personal file management relies on Linux directory descriptors and renameat2.

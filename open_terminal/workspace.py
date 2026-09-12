@@ -23,6 +23,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
+from open_terminal.utils.service_processes import open_helper, run_helper
+
 
 CHUNK_SIZE = 64 * 1024
 MAX_TEXT_SIZE = 2 * 1024 * 1024
@@ -391,7 +393,7 @@ def _run_file_operation(
     filesystem: Any, action: str, payload: dict[str, object], *, input_bytes: bytes | None = None
 ) -> dict[str, object]:
     try:
-        completed = subprocess.run(
+        completed = run_helper(
             _operation_command(filesystem, action, payload),
             stdin=subprocess.DEVNULL if input_bytes is None else None,
             input=input_bytes,
@@ -426,41 +428,31 @@ async def _run_upload_operation(
     payload: dict[str, object] = {'path': path, 'conflict': conflict}
     if isinstance(size, int):
         payload['expected_size'] = size
+    command = _operation_command(filesystem, 'upload', payload)
     try:
-        process = subprocess.Popen(
-            _operation_command(filesystem, 'upload', payload),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+        async with open_helper(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
             env=_HELPER_ENV,
             cwd='/',
-        )
+        ) as process:
+            assert process.stdin is not None
+            try:
+                while chunk := await upload.read(CHUNK_SIZE):
+                    process.stdin.write(chunk)
+                    await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            process.stdin.close()
+            stdout, _ = await process.communicate()
+            return _decode_operation_result(
+                subprocess.CompletedProcess(command, process.returncode, stdout, b''),
+                'upload',
+            )
     except OSError:
         raise _mutation_error_response('io', 'upload') from None
-
-    try:
-        assert process.stdin is not None
-        try:
-            while chunk := await upload.read(CHUNK_SIZE):
-                try:
-                    await asyncio.to_thread(process.stdin.write, chunk)
-                except BrokenPipeError:
-                    break
-        finally:
-            try:
-                await asyncio.to_thread(process.stdin.close)
-            except BrokenPipeError:
-                pass
-            process.stdin = None
-        stdout, _ = await asyncio.to_thread(process.communicate)
-    except BaseException:
-        process.kill()
-        await asyncio.to_thread(process.wait)
-        raise
-
-    return _decode_operation_result(
-        subprocess.CompletedProcess(process.args, process.returncode, stdout, b''), 'upload'
-    )
 
 
 def install_workspace_routes(app: Any, get_filesystem: Callable[..., Any], verify_api_key: Callable[..., Any]) -> None:

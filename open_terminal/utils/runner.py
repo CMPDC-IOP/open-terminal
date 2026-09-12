@@ -7,6 +7,12 @@ import subprocess
 import time
 from abc import ABC, abstractmethod
 
+from open_terminal import execution as execution_runtime
+from open_terminal.utils.compute_environment import (
+    compute_thread_environment,
+    with_compute_thread_defaults,
+)
+
 try:
     import fcntl
     import pty
@@ -53,30 +59,78 @@ class ProcessRunner(ABC):
     def pid(self) -> int:
         """PID of the child process."""
 
+    @property
+    def execution_info(self) -> dict | None:
+        """Managed execution lifetime metadata, when this runner has it."""
+        return None
+
 
 class PtyRunner(ProcessRunner):
     """Spawn a command under a pseudo-terminal (Unix)."""
 
-    def __init__(self, command: str, cwd: str | None, env: dict | None, run_as_user: str | None = None):
-        if run_as_user:
+    def __init__(
+        self,
+        command: str,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        run_as_user: str | None = None,
+        user_env: dict[str, str] | None = None,
+        owner: str | None = None,
+        managed_launch=None,
+    ):
+        env = with_compute_thread_defaults(env)
+        if execution_runtime.enabled() and (not owner or not run_as_user):
+            raise ValueError("Hard execution requires an owner and target user")
+        if run_as_user and not execution_runtime.enabled():
             # Build the inner command: optionally cd first, then run the command.
             inner = f"cd {shlex.quote(cwd)} && {command}" if cwd else command
-            command = f"sudo -u {shlex.quote(run_as_user)} -- bash -c {shlex.quote(inner)}"
+            # Sudo itself receives only this fixed parent environment.  Request
+            # variables are installed by env(1) only after sudo has changed to
+            # the isolated user, preserving the API without exposing sudo to
+            # untrusted environment entries.
+            inner_env = dict(user_env or {})
+            inner_env.update(compute_thread_environment(env))
+            assignments = " ".join(
+                shlex.quote(f"{key}={value}") for key, value in inner_env.items()
+            )
+            command = (
+                f"sudo -H -u {shlex.quote(run_as_user)} -- env {assignments} "
+                f"bash -c {shlex.quote(inner)}"
+            )
             cwd = None  # Popen runs as parent user — can't chdir into chmod 700 dirs
+            env = {
+                "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                "LANG": "C.UTF-8",
+                "TERM": os.environ.get("TERM", "xterm-256color"),
+            }
         master_fd, slave_fd = pty.openpty()
         try:
             # Set a reasonable default window size (80x24).
             fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-            self._process = subprocess.Popen(
-                command,
-                shell=True,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                cwd=cwd,
-                env=env,
-                start_new_session=True,
-            )
+            if managed_launch is not None:
+                self._process = execution_runtime.spawn_prepared(
+                    managed_launch,
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                )
+            elif execution_runtime.enabled():
+                self._process = execution_runtime.spawn(
+                    owner, run_as_user, ["/bin/bash", "-c", command],
+                    cwd=cwd, env=with_compute_thread_defaults(user_env or {}),
+                    stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                )
+            else:
+                self._process = subprocess.Popen(
+                    command,
+                    shell=True,
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    cwd=cwd,
+                    env=env,
+                    start_new_session=True,
+                )
         except Exception:
             os.close(slave_fd)
             os.close(master_fd)
@@ -122,12 +176,17 @@ class PtyRunner(ProcessRunner):
                 pass
 
     def kill(self, force: bool = False) -> None:
-        self._signal_group(signal.SIGKILL if force else signal.SIGTERM)
+        if execution_runtime.enabled():
+            execution_runtime.stop(self._process, force=force)
+        else:
+            self._signal_group(signal.SIGKILL if force else signal.SIGTERM)
 
     async def wait(self) -> int:
         return await asyncio.to_thread(self._process.wait)
 
     def close(self) -> None:
+        if execution_runtime.enabled():
+            execution_runtime.stop(self._process, reason="completed")
         try:
             os.close(self._master_fd)
         except OSError:
@@ -137,17 +196,25 @@ class PtyRunner(ProcessRunner):
     def pid(self) -> int:
         return self._process.pid
 
+    @property
+    def execution_info(self) -> dict | None:
+        if not execution_runtime.enabled():
+            return None
+        return execution_runtime.describe(self._process)
+
 
 class PipeRunner(ProcessRunner):
     """Spawn a command with stdin/stdout/stderr pipes (cross-platform fallback)."""
 
-    def __init__(self, command: str, cwd: str | None, env: dict | None):
+    def __init__(self, command: str, cwd: str | None, env: dict[str, str] | None):
         self._process: asyncio.subprocess.Process = None  # type: ignore[assignment]
         self._command = command
         self._cwd = cwd
         self._env = env
 
     async def start(self) -> None:
+        if execution_runtime.enabled():
+            raise RuntimeError("Hard execution requires the managed Unix PTY runner")
         self._process = await asyncio.create_subprocess_shell(
             self._command,
             stdout=asyncio.subprocess.PIPE,
@@ -206,10 +273,8 @@ class PipeRunner(ProcessRunner):
 class WinPtyRunner(ProcessRunner):
     """Spawn a command under a Windows pseudo-terminal (ConPTY via pywinpty)."""
 
-    def __init__(self, command: str, cwd: str | None, env: dict | None):
-        spawn_env = os.environ.copy()
-        if env:
-            spawn_env.update(env)
+    def __init__(self, command: str, cwd: str | None, env: dict[str, str] | None):
+        spawn_env = with_compute_thread_defaults(env)
 
         # Determine the executable and arguments.
         # PtyProcess.spawn expects a list: [executable, *args]
@@ -283,14 +348,45 @@ class WinPtyRunner(ProcessRunner):
 async def create_runner(
     command: str,
     cwd: str | None,
-    env: dict | None,
+    env: dict[str, str] | None,
     run_as_user: str | None = None,
+    user_env: dict[str, str] | None = None,
+    owner: str | None = None,
 ) -> ProcessRunner:
     """Factory: create a PTY runner on Unix, WinPTY runner on Windows, or pipe fallback."""
+    if execution_runtime.enabled() and not _PTY_AVAILABLE:
+        raise RuntimeError("Hard execution requires the Unix PTY backend")
+    if execution_runtime.enabled():
+        managed_env = dict(user_env or {})
+        managed_env.update(compute_thread_environment(env))
+        launch = await execution_runtime.prepare_async(
+            owner,
+            run_as_user,
+            ["/bin/bash", "-c", command],
+            cwd=cwd,
+            env=managed_env,
+        )
+        try:
+            return await execution_runtime.async_call(
+                PtyRunner,
+                command,
+                cwd,
+                env,
+                run_as_user=run_as_user,
+                user_env=user_env,
+                owner=owner,
+                managed_launch=launch,
+                cleanup=lambda instance: (instance.kill(force=True), instance.close()),
+            )
+        except BaseException:
+            await execution_runtime.async_call(launch.abort)
+            raise
     if _PTY_AVAILABLE:
-        return PtyRunner(command, cwd, env, run_as_user=run_as_user)
+        return PtyRunner(
+            command, cwd, env, run_as_user=run_as_user, user_env=user_env, owner=owner
+        )
     if _WINPTY_AVAILABLE:
         return WinPtyRunner(command, cwd, env)
-    runner = PipeRunner(command, cwd, env)
+    runner = PipeRunner(command, cwd, with_compute_thread_defaults(env))
     await runner.start()
     return runner
