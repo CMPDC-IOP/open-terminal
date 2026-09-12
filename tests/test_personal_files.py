@@ -822,3 +822,54 @@ def test_trash_refuses_reserved_workspace_and_tampered_metadata(client):
         == 403
     )
     assert not (home / 'safe.txt').exists()
+
+
+def test_file_helpers_return_retryable_overload_without_blocking_browsing(client, monkeypatch):
+    from open_terminal.utils import service_processes
+
+    test_client, homes = client
+    pool = service_processes.HelperPool(1, 0, 0)
+    monkeypatch.setattr(service_processes, '_pool', pool)
+    with pool.sync_slot():
+        mkdir = test_client.post('/home-files/mkdir', json={'path': 'busy'}, headers=home_mutation_headers())
+        upload = test_client.post(
+            '/home-files/upload', data={'path': 'busy.txt'},
+            files={'file': ('busy.txt', b'content')}, headers=home_mutation_headers(),
+        )
+        for response in (mkdir, upload):
+            assert response.status_code == 503
+            assert response.headers['retry-after'] == '1'
+        assert home_request(test_client).status_code == 200
+    assert not (Path(homes['alice-id'].home) / 'busy.txt').exists()
+    assert test_client.post('/home-files/mkdir', json={'path': 'ready'}, headers=home_mutation_headers()).status_code == 200
+
+
+def test_cancelled_upload_reaps_helper_and_releases_capacity(client, monkeypatch):
+    import asyncio
+
+    from open_terminal.utils import service_processes
+
+    _, homes = client
+    pool = service_processes.HelperPool(1, 0, 0)
+    monkeypatch.setattr(service_processes, '_pool', pool)
+
+    async def exercise():
+        reading = asyncio.Event()
+
+        class SlowUpload:
+            size = None
+
+            async def read(self, size):
+                reading.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(workspace._run_upload_operation(homes['alice-id'], SlowUpload(), 'cancelled.txt', 'error'))
+        await asyncio.wait_for(reading.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert pool._active == 0
+        async with pool.slot():
+            pass
+
+    asyncio.run(exercise())

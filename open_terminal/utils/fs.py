@@ -14,10 +14,11 @@ so that files belong to the provisioned user, not the server process.
 import asyncio
 import os
 import shutil
-import subprocess
 
 import aiofiles
 import aiofiles.os
+
+from open_terminal.utils.service_processes import run_helper
 
 
 class UserFS:
@@ -99,12 +100,12 @@ class UserFS:
         """
         if self.username:
             await asyncio.to_thread(
-                subprocess.run,
+                run_helper,
                 ["sudo", "chown", f"{self.username}:{self.username}", path],
                 check=True, capture_output=True,
             )
             await asyncio.to_thread(
-                subprocess.run,
+                run_helper,
                 ["sudo", "chmod", "g+w", path],
                 check=True, capture_output=True,
             )
@@ -124,7 +125,7 @@ class UserFS:
             return
         # Create as the provisioned user to bypass 755 restrictions.
         await asyncio.to_thread(
-            subprocess.run,
+            run_helper,
             ["sudo", "-u", self.username, "mkdir", "-p", path],
             check=True, capture_output=True,
         )
@@ -134,7 +135,7 @@ class UserFS:
         home = os.path.normpath(self.home)
         while target != home and target.startswith(home + "/"):
             await asyncio.to_thread(
-                subprocess.run,
+                run_helper,
                 ["sudo", "chmod", "2770", target],
                 check=True, capture_output=True,
             )

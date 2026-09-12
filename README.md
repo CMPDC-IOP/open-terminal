@@ -152,6 +152,73 @@ You can also point to a specific config file:
 open-terminal run --config /path/to/my-config.toml
 ```
 
+### Resource Limits
+
+The settings above also accept environment variables using the `OPEN_TERMINAL_` prefix and uppercase key names. File helpers share a bounded pool per service process; a full queue or wait timeout returns `503` with `Retry-After: 1`. Pool sizing and cleanup timings use internal defaults. This does not limit HTTP body parsing or total request size.
+
+Unset OpenMP, OpenBLAS, MKL, NumExpr, VECLIB and BLIS thread variables default to 1 across commands, terminals and notebooks. Explicit environment or kernelspec values take precedence. These are library defaults; hard CPU, memory and thread limits require cgroup mode.
+
+Set `OPEN_TERMINAL_EXECUTION_MODE=cgroup` and `OPEN_TERMINAL_EXECUTION_POLICY_FILE=/path/to/policy.json` (TOML: `execution_mode`, `execution_policy_file`). The default `legacy` mode provides no compute resource hard limits or total runtime deadline.
+
+Cgroup mode requires Linux cgroup v2 with CPU, memory, PID, Swap and `cgroup.kill` support; a root, multi-user service with one worker; and an administrator-provided, writable, root-owned dedicated subtree. Policy, application code and interpreter paths must not be writable by compute users. Startup uses the `nobody` account for an actual launch probe and fails if requirements are unmet or untracked tasks remain; it does not silently fall back to legacy mode. Task recovery after restart is outside the current scope; residual tasks must be reconciled before startup.
+
+For Docker, mount the policy read-only and let the image entrypoint prepare the
+private cgroup namespace. No custom entrypoint or host bootstrap script is needed:
+
+```yaml
+services:
+  terminal:
+    image: open-terminal:0.12.5-local
+    user: '0:0'
+    cgroup: private
+    cap_add: [SYS_ADMIN]
+    cpus: 3
+    mem_limit: 4g
+    memswap_limit: 4g
+    pids_limit: 640
+    environment:
+      OPEN_TERMINAL_API_KEY: ${OPEN_TERMINAL_API_KEY:?}
+      OPEN_TERMINAL_MULTI_USER: 'true'
+      OPEN_TERMINAL_EXECUTION_MODE: cgroup
+      OPEN_TERMINAL_EXECUTION_POLICY_FILE: /etc/open-terminal/policy.json
+    volumes:
+      - ./terminal-policy.json:/etc/open-terminal/policy.json:ro
+```
+
+Automatic Docker bootstrap requires an absolute policy path on a read-only mount,
+and `cgroup_root` must be a dedicated direct child of `/sys/fs/cgroup` other than
+`bootstrap`. The source file may be owned by the host deployer: the entrypoint
+validates it and writes a root-owned internal runtime copy. CAP_SYS_ADMIN is
+dropped before starting the API. Do not use the host cgroup namespace or mount the
+host cgroup tree. Non-Docker deployments continue to prepare their own subtree
+and root-owned policy. Legacy mode is unchanged. Recreate the container after
+changing limits; running tasks and queues are not restored.
+
+Example policy (size budgets for your deployment):
+
+```json
+{
+  "cgroup_root": "/sys/fs/cgroup/open-terminal",
+  "service": {"cpu_millis": 500, "memory_bytes": 536870912, "pids": 128},
+  "helpers": {"cpu_millis": 500, "memory_bytes": 536870912, "pids": 128},
+  "compute": {"cpu_millis": 2000, "memory_bytes": 2147483648, "pids": 256},
+  "user": {"cpu_millis": 1000, "memory_bytes": 1073741824, "pids": 128},
+  "max_tasks": 8,
+  "max_user_tasks": 4,
+  "max_runtime": 3600
+}
+```
+
+`cpu_millis=1000` is one CPU of time. Resource values must be positive integers, memory page-aligned, and `user <= compute`. Swap is always disabled for service, helpers and compute, including every user. The dedicated subtree must have finite limits; it and its visible ancestors must accommodate `service + helpers + compute`, without ancestor `memory.oom.group=1`. User processes must not have writable cgroup controls or access to privileged services such as a Docker socket. This is resource control for trusted users, not complete hostile-tenant, disk, network or device isolation.
+
+`max_runtime` is optional (default 3600 seconds) and must be finite and positive. Task counts must be positive and `max_user_tasks <= max_tasks`. These are the only accepted policy fields; unknown or duplicate fields are rejected. Queue bounds, queue wait, startup/cleanup timeouts and termination grace use internal defaults.
+
+When migrating an older policy, remove `task`, each `swap_bytes`, and the former queue/timing fields (`max_queue`, `max_user_queue`, `queue_timeout`, `start_timeout`, `cleanup_timeout`, `terminate_grace`). The former `compute_threads`, `file_helper_*` and `idempotency_*` TOML/environment settings are no longer read.
+
+Commands, PTYs and notebook kernels share one user budget across sessions, including idle kernels. Tasks have no separate resource quota; their cgroups only identify descendants for stopping and cleanup. Each active user reserves a full user budget until their last task is drained. Waiting is bounded and scheduled fairly by user; a full queue or timeout returns `429` with `Retry-After: 1`. Even `wait=0` waits for admission; disconnecting the last creation waiter cancels pending work. There is no persistent queue or separate queued-task API.
+
+`max_runtime` starts at actual launch, includes idle time and cannot be renewed by a request. Expiry sends SIGTERM, then kills remaining descendants after the termination grace period; quota is returned only after the task cgroup is empty. API `wait` and `EXECUTE_TIMEOUT` only limit response waiting. Managed responses expose `execution` timestamps and reasons (`completed`, `cancelled`, `timed_out`, `oom`, `start_failed`, `shutdown`); stopped notebook kernels reject execution with `409`.
+
 ### File Browser Root
 
 Open Terminal reports file-browser root metadata from `GET /files/cwd` so clients can hide parent navigation above a friendly starting point.

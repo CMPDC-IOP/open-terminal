@@ -19,6 +19,8 @@ from open_terminal.utils.documents import (
     extract_epub,
 )
 
+from open_terminal.utils.service_processes import open_helper
+
 TIMEOUT_SECONDS = 60
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TEXT_CHARS = 2_000_000
@@ -213,63 +215,60 @@ async def run_comparison(request, payload, fs, cwd=None):
             }
         else:
             command = ["sudo", "-n", "-u", fs.username, "--", *command]
-    process = await asyncio.create_subprocess_exec(
+    async with open_helper(
         *command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         **process_options,
-    )
-    task = asyncio.create_task(
-        process.communicate(
-            json.dumps(
-                {
-                    "original": paths[0],
-                    "revised": paths[1],
-                    "ignore_whitespace": payload.ignore_whitespace,
-                }
-            ).encode()
-        )
-    )
-
-    async def disconnected():
-        # A blocking receive also works through Starlette's BaseHTTPMiddleware;
-        # is_disconnected() uses an immediately cancelled receive there.
-        while (await request.receive())["type"] != "http.disconnect":
-            pass
-
-    disconnect = asyncio.create_task(disconnected())
-    try:
-        done, _ = await asyncio.wait(
-            {task, disconnect},
-            timeout=TIMEOUT_SECONDS,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if not done:
-            raise TimeoutError()
-        if disconnect in done:
-            raise HTTPException(499, "Comparison cancelled.")
-        stdout, stderr = await task
-        if process.returncode:
-            raise HTTPException(
-                422,
-                "Comparison failed. Check that the document libraries are installed and the files are readable.",
+    ) as process:
+        task = asyncio.create_task(
+            process.communicate(
+                json.dumps(
+                    {
+                        "original": paths[0],
+                        "revised": paths[1],
+                        "ignore_whitespace": payload.ignore_whitespace,
+                    }
+                ).encode()
             )
-        result = json.loads(stdout)
-        if "error" in result:
-            raise HTTPException(422, result["error"])
-        return result
-    except TimeoutError as exc:
-        raise HTTPException(
-            408, "Comparison exceeded the 60 second limit. Try smaller files."
-        ) from exc
-    finally:
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
-        task.cancel()
-        disconnect.cancel()
-        await asyncio.gather(task, disconnect, return_exceptions=True)
+        )
+
+        async def disconnected():
+            # A blocking receive also works through Starlette's BaseHTTPMiddleware;
+            # is_disconnected() uses an immediately cancelled receive there.
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+
+        disconnect = asyncio.create_task(disconnected())
+        try:
+            done, _ = await asyncio.wait(
+                {task, disconnect},
+                timeout=TIMEOUT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError()
+            if disconnect in done:
+                raise HTTPException(499, "Comparison cancelled.")
+            stdout, stderr = await task
+            if process.returncode:
+                raise HTTPException(
+                    422,
+                    "Comparison failed. Check that the document libraries are installed and the files are readable.",
+                )
+            result = json.loads(stdout)
+            if "error" in result:
+                raise HTTPException(422, result["error"])
+            return result
+        except TimeoutError as exc:
+            raise HTTPException(
+                408, "Comparison exceeded the 60 second limit. Try smaller files."
+            ) from exc
+        finally:
+            task.cancel()
+            disconnect.cancel()
+            await asyncio.gather(task, disconnect, return_exceptions=True)
 
 
 if __name__ == "__main__":

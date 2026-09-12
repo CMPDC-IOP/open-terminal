@@ -131,6 +131,7 @@ ENABLE_NOTEBOOKS = os.environ.get(
     str(config.get("enable_notebooks", True)),
 ).lower() not in ("false", "0", "no")
 
+
 ENABLE_SYSTEM_PROMPT = os.environ.get(
     "OPEN_TERMINAL_ENABLE_SYSTEM_PROMPT",
     str(config.get("enable_system_prompt", True)),
@@ -141,10 +142,14 @@ SYSTEM_PROMPT = os.environ.get(
     config.get("system_prompt", ""),
 )
 
-MULTI_USER = os.environ.get(
-    "OPEN_TERMINAL_MULTI_USER",
-    str(config.get("multi_user", False)),
-).lower() not in ("false", "0", "no", "")
+def _resolve_multi_user() -> bool:
+    return os.environ.get(
+        "OPEN_TERMINAL_MULTI_USER",
+        str(config.get("multi_user", False)),
+    ).lower() not in ("false", "0", "no", "")
+
+
+MULTI_USER = _resolve_multi_user()
 
 USER_PREFIX = os.environ.get(
     "OPEN_TERMINAL_USER_PREFIX",

@@ -1,6 +1,14 @@
 #!/bin/bash
 set -e
 
+# Prepare mounted policies only at the root of Docker's private cgroup namespace.
+# After handoff the API is already inside its subtree, so this does not recurse.
+if [ "${OPEN_TERMINAL_EXECUTION_MODE:-legacy}" = "cgroup" ] && \
+   [ -n "${OPEN_TERMINAL_EXECUTION_POLICY_FILE:-}" ] && \
+   [ -f /.dockerenv ] && [ "$(cat /proc/self/cgroup)" = "0::/" ]; then
+    exec python3 -I -m open_terminal.execution.docker_bootstrap "$@"
+fi
+
 # -----------------------------------------------------------------------
 # Docker-secrets support: resolve <VAR>_FILE → <VAR>
 # Follows the convention used by the official PostgreSQL image.
