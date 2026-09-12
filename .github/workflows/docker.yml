@@ -8,7 +8,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
@@ -37,6 +36,10 @@ jobs:
       packages: write
 
     steps:
+      - name: Normalize image repository
+        shell: bash
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: docker/setup-qemu-action@v3
@@ -102,6 +105,10 @@ jobs:
       packages: write
 
     steps:
+      - name: Normalize image repository
+        shell: bash
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
