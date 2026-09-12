@@ -39,6 +39,7 @@ from open_terminal.utils.compute_environment import (
 from open_terminal.utils.service_processes import HelpersBusy, run_helper
 from open_terminal.utils.fs import UserFS
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
+from open_terminal.utils.idempotency import get_registry, run_creation
 
 MATCH_PAGE_SIZE = 100
 MAX_CONTENT_MATCHES_PER_FILE = 3
@@ -222,6 +223,7 @@ def _preview_pdf(target: str, username: str | None = None) -> bytes | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    get_registry()
     await execution_runtime.async_call(execution_runtime.initialize)
     try:
         yield
@@ -1646,25 +1648,45 @@ async def execute(
         (request.env or {}) if execution_runtime.enabled() else ({**os.environ, **request.env} if request.env else None)
     )
 
-    with execution_runtime.queue_request(http_request):
-        runner = await create_runner(
-            request.command,
-            cwd,
-            subprocess_env,
-            run_as_user=fs.username,
-            user_env=request.env,
-            owner=http_request.headers.get("x-user-id"),
+    async def create_once(shared_request: Request) -> BackgroundProcess:
+        """Start the command once, keeping the first request's resolved cwd."""
+        with execution_runtime.queue_request(shared_request):
+            runner = await create_runner(
+                request.command,
+                cwd,
+                subprocess_env,
+                run_as_user=fs.username,
+                user_env=request.env,
+                owner=shared_request.headers.get("x-user-id"),
+            )
+
+        process_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+        log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")
+        background_process = BackgroundProcess(
+            id=process_id, command=request.command, runner=runner, log_path=log_path,
+            user_id=shared_request.headers.get("x-user-id", ""),
+            session_id=shared_request.headers.get("x-session-id", ""),
+        )
+        background_process.log_task = asyncio.create_task(log_process(background_process))
+        _processes[process_id] = background_process
+        return background_process
+
+    def process_active(process: BackgroundProcess) -> bool:
+        execution = process.runner.execution_info
+        return (
+            execution.get("state") != "finished"
+            if execution is not None
+            else not process.log_task.done()
         )
 
-    process_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
-    log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")
-    background_process = BackgroundProcess(
-        id=process_id, command=request.command, runner=runner, log_path=log_path,
-        user_id=http_request.headers.get("x-user-id", ""),
-        session_id=http_request.headers.get("x-session-id", ""),
+    background_process = await run_creation(
+        http_request,
+        "execute",
+        request.model_dump(mode="json"),
+        create_once,
+        active=process_active,
+        exists=lambda process: _processes.get(process.id) is process,
     )
-    background_process.log_task = asyncio.create_task(log_process(background_process))
-    _processes[process_id] = background_process
 
     if wait is None and EXECUTE_TIMEOUT:
         wait = EXECUTE_TIMEOUT
@@ -2008,8 +2030,7 @@ if ENABLE_TERMINAL:
                 pty_proc.terminate()
 
 
-    @app.post("/api/terminals", dependencies=[Depends(verify_api_key)], include_in_schema=False)
-    async def create_terminal(request: Request):
+    async def _create_terminal_once(request: Request):
         """Create a new terminal session and return its ID."""
         if _TERMINAL_BACKEND is None:
             return JSONResponse(
@@ -2155,6 +2176,50 @@ if ENABLE_TERMINAL:
             input_lock=asyncio.Lock(),
         )
         return _terminal_response(session_id, session)
+
+
+    @app.post("/api/terminals", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+    async def create_terminal(request: Request):
+        """Create one terminal per idempotency key and owner context."""
+        # Keep the execution authorization and filesystem identity checks ahead
+        # of idempotency lookup, including for cached responses.
+        has_idempotency_key = bool(request.headers.get("idempotency-key"))
+        if has_idempotency_key and _TERMINAL_BACKEND is not None and execution_runtime.enabled():
+            if not request.headers.get("x-user-id", "").strip():
+                raise HTTPException(status_code=403, detail="X-User-Id is required")
+            if _TERMINAL_BACKEND != "pty":
+                raise HTTPException(status_code=503, detail="Hard execution requires Unix PTY")
+        if has_idempotency_key and _TERMINAL_BACKEND is not None:
+            get_filesystem(request)
+
+        def terminal_active(response) -> bool:
+            if isinstance(response, JSONResponse):
+                return False
+            session_id = response.get("id") if isinstance(response, dict) else None
+            session = _terminal_sessions.get(session_id) if session_id else None
+            if session is None:
+                return False
+            execution = _terminal_execution_metadata(session)
+            return (
+                execution.get("state") != "finished"
+                if execution is not None
+                else _session_is_alive(session)
+            )
+
+        def terminal_exists(response) -> bool:
+            if isinstance(response, JSONResponse):
+                return True
+            session_id = response.get("id") if isinstance(response, dict) else None
+            return bool(session_id and session_id in _terminal_sessions)
+
+        return await run_creation(
+            request,
+            "terminal",
+            {},
+            _create_terminal_once,
+            active=terminal_active,
+            exists=terminal_exists,
+        )
 
 
     def _session_is_alive(session: dict) -> bool:

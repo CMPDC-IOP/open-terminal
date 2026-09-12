@@ -123,7 +123,18 @@ async def main():
                 await a.post(
                     "/notebooks",
                     json={"path": "probe.ipynb"},
+                    headers={"Idempotency-Key": "nb"},
                 )
+            )
+            assert (
+                checked(
+                    await a.post(
+                        "/notebooks",
+                        json={"path": "probe.ipynb"},
+                        headers={"Idempotency-Key": "nb"},
+                    )
+                )["id"]
+                == session["id"]
             )
             cell = checked(
                 await a.post(
@@ -138,7 +149,13 @@ async def main():
             )
             assert cell["status"] == "ok", cell
             terminal = checked(
-                await a.post("/api/terminals")
+                await a.post("/api/terminals", headers={"Idempotency-Key": "pty"})
+            )
+            assert (
+                checked(
+                    await a.post("/api/terminals", headers={"Idempotency-Key": "pty"})
+                )["id"]
+                == terminal["id"]
             )
             async with connect(
                 f"ws://127.0.0.1:8000/api/terminals/{terminal['id']}",
@@ -149,9 +166,19 @@ async def main():
             ) as ws:
                 await ws.send(json.dumps({"type": "auth", "token": TOKEN}))
                 await ws.send((worker_command + "\n").encode())
-                commands = [checked(await a.post(
-                    "/execute?wait=0", json={"command": worker_command}
-                ))]
+                command_headers = {"Idempotency-Key": "cmd"}
+                responses = await asyncio.gather(
+                    *[
+                        a.post(
+                            "/execute?wait=0",
+                            json={"command": worker_command},
+                            headers=command_headers,
+                        )
+                        for _ in range(3)
+                    ]
+                )
+                commands = [checked(r) for r in responses]
+                assert len({r["id"] for r in commands}) == 1
                 owner = (
                     ROOT
                     / "compute"

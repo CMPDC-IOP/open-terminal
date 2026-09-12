@@ -23,6 +23,7 @@ from open_terminal.utils.compute_environment import (
     with_compute_thread_defaults,
 )
 from open_terminal.utils.service_processes import HelpersBusy, open_helper, run_helper
+from open_terminal.utils.idempotency import run_creation
 
 _IDLE_TIMEOUT = 30 * 60
 _SUDO_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
@@ -100,7 +101,7 @@ async def _idle_cleanup_loop() -> None:
             await _destroy_session(session_id)
 
 
-async def _cleanup_session_resources(session: _Session) -> None:
+async def _cleanup_session_resources(session: _Session) -> bool:
     try:
         manager = getattr(session.client, "km", None)
         if manager is not None:
@@ -110,9 +111,11 @@ async def _cleanup_session_resources(session: _Session) -> None:
         await session.client._async_cleanup_kernel()
     except Exception:
         log.exception("Failed to clean up notebook kernel %s", session.id)
+        return False
     finally:
         if session.runtime_directory:
             await asyncio.to_thread(shutil.rmtree, session.runtime_directory, True)
+    return True
 
 
 async def _destroy_session(session_id: str, *, reason: str = "completed") -> None:
@@ -558,33 +561,55 @@ def create_notebooks_router(
             req.path, filesystem, home=home, multi_user=multi_user
         )
 
-        content = await _read_notebook(
-            filesystem, path, relative_path, username=username, home=home
-        )
-        try:
-            notebook = nbformat.reads(content, as_version=4)
-        except Exception as error:
-            raise HTTPException(status_code=400, detail="Invalid notebook") from error
-        kernel_name = notebook.metadata.get("kernelspec", {}).get("name", "python3")
-        client, runtime_directory = _new_notebook_client(
-            notebook,
-            kernel_name,
-            username=username,
-            home=home,
-            working_directory=os.path.dirname(path),
-            owner=user_id,
-        )
-        try:
-            client.create_kernel_manager()
-            with execution_runtime.queue_request(http_request):
-                await client.async_start_new_kernel(
-                    cwd=os.path.dirname(path), env=with_compute_thread_defaults({} if execution_runtime.enabled() else None)
+        async def create_once(shared_request: Request) -> CreateSessionResponse:
+            content = await _read_notebook(
+                filesystem, path, relative_path, username=username, home=home
+            )
+            try:
+                notebook = nbformat.reads(content, as_version=4)
+            except Exception as error:
+                raise HTTPException(status_code=400, detail="Invalid notebook") from error
+            kernel_name = notebook.metadata.get("kernelspec", {}).get("name", "python3")
+            client, runtime_directory = _new_notebook_client(
+                notebook,
+                kernel_name,
+                username=username,
+                home=home,
+                working_directory=os.path.dirname(path),
+                owner=user_id,
+            )
+            try:
+                client.create_kernel_manager()
+                with execution_runtime.queue_request(shared_request):
+                    await client.async_start_new_kernel(
+                        cwd=os.path.dirname(path), env=with_compute_thread_defaults({} if execution_runtime.enabled() else None)
+                    )
+                    await client.async_start_new_kernel_client()
+            except BaseException as error:
+                log.exception("Notebook kernel startup failed for %s", kernel_name)
+                failed = _Session(
+                    "",
+                    path,
+                    relative_path,
+                    notebook,
+                    client,
+                    user_id=user_id,
+                    context_id=context_id,
+                    username=username,
+                    home=home,
+                    runtime_directory=runtime_directory,
                 )
-                await client.async_start_new_kernel_client()
-        except BaseException as error:
-            log.exception("Notebook kernel startup failed for %s", kernel_name)
-            failed = _Session(
-                "",
+                if not await _cleanup_session_resources(failed):
+                    raise RuntimeError("Failed kernel cleanup is incomplete") from error
+                if isinstance(error, (asyncio.CancelledError, HelpersBusy, HTTPException)):
+                    raise
+                raise HTTPException(
+                    status_code=500, detail=f"Failed to start kernel '{kernel_name}'"
+                ) from error
+            _ensure_cleanup_task()
+            session_id = uuid.uuid4().hex[:12]
+            _sessions[session_id] = _Session(
+                session_id,
                 path,
                 relative_path,
                 notebook,
@@ -595,27 +620,23 @@ def create_notebooks_router(
                 home=home,
                 runtime_directory=runtime_directory,
             )
-            await _cleanup_session_resources(failed)
-            if isinstance(error, (asyncio.CancelledError, HelpersBusy, HTTPException)):
-                raise
-            raise HTTPException(
-                status_code=500, detail=f"Failed to start kernel '{kernel_name}'"
-            ) from error
-        _ensure_cleanup_task()
-        session_id = uuid.uuid4().hex[:12]
-        _sessions[session_id] = _Session(
-            session_id,
-            path,
-            relative_path,
-            notebook,
-            client,
-            user_id=user_id,
-            context_id=context_id,
-            username=username,
-            home=home,
-            runtime_directory=runtime_directory,
+            return CreateSessionResponse(id=session_id, kernel=kernel_name, status="ready")
+
+        def session_active(response: CreateSessionResponse) -> bool:
+            session = _sessions.get(response.id)
+            if session is None:
+                return False
+            execution = _session_execution_info(session)
+            return not execution or execution.get("state") != "finished"
+
+        return await run_creation(
+            http_request,
+            "notebook",
+            req.model_dump(mode="json"),
+            create_once,
+            active=session_active,
+            exists=lambda response: response.id in _sessions,
         )
-        return CreateSessionResponse(id=session_id, kernel=kernel_name, status="ready")
 
     @router.post(
         "/{session_id}/execute",
