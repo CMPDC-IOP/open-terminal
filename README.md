@@ -219,6 +219,20 @@ Commands, PTYs and notebook kernels share one user budget across sessions, inclu
 
 `max_runtime` starts at actual launch, includes idle time and cannot be renewed by a request. Expiry sends SIGTERM, then kills remaining descendants after the termination grace period; quota is returned only after the task cgroup is empty. API `wait` and `EXECUTE_TIMEOUT` only limit response waiting. Managed responses expose `execution` timestamps and reasons (`completed`, `cancelled`, `timed_out`, `oom`, `start_failed`, `shutdown`); stopped notebook kernels reject execution with `409`.
 
+### Creation Request Retries
+
+`POST /execute`, `POST /api/terminals` and `POST /notebooks` accept an optional `Idempotency-Key` header. Use the same key and creation body for retries, a new key for a new task. Keys contain 1–128 ASCII letters, digits, `.`, `_`, `:` or `-`. Scope includes the full user ID, session ID and endpoint; authentication still runs on every request. Invalid/repeated headers return `400`, different parameters with the same key return `409`, and normalized parameters over 1 MiB return `413`.
+
+Concurrent retries share creation; one disconnected waiter does not cancel other waiters. `/execute` reuses the process ID but rereads output (`wait` and `tail` are not creation parameters); terminals and notebooks replay the initial creation response. Notebook file contents are not fingerprinted: use a new key to start a kernel from changed content.
+
+Creation failures, including queue `429`, release their key after cleanup completes and the current waiters finish. Concurrent waiters receive the same failure; a subsequent request can retry with the same key. Cancelled creation returns `409` to attached waiters and follows the same retry rule. Unexpected errors with unconfirmed cleanup retain their key, even past the TTL, until service restart; retries replay `500` rather than create another resource. Deleted resources return `410` while their records remain. Record-capacity or retry-concurrency `429` can be retried with the same key. Records expire after an internal TTL from creation completion, but pending/running/cleaning resources remain pinned; full capacity rejects new keys rather than evicting records. Record counts and concurrent waiters remain bounded by internal limits. Deduplication is in-memory, per process, and does not survive restarts or span workers.
+
+### Personal Files and Tests
+
+This fork provides `/home-files` and `/workspace-files` browsing/content APIs plus home-file mkdir, move, upload, text/save, trash and restore operations. They require API-key authentication and a multi-user `X-User-Id`, and are excluded from OpenAPI/MCP discovery. Paths are relative to the user's home or `w/` workspace; symlinks, traversal and special files are rejected. Writes run as the target OS user. Uploads support conflict handling, text saves use version checks (up to 2 MiB), and restore never overwrites existing files. These protections apply to file APIs, not arbitrary shell commands.
+
+Run regression tests with `uv run --group dev python -m pytest -q`. Disposable Docker acceptance scripts remain in [tests/](tests/): `execution_docker_bootstrap.py`, `execution_kernel_acceptance.py`, `execution_http_acceptance.py` and `compute_container_smoke.py`. The cgroup suites require a private container cgroup namespace, writable delegation and explicit `OT_EXECUTION_DISPOSABLE_TEST=1`; use Tini to reap descendants. The bootstrap checks outer limits of at most 2 CPUs, 2 GiB RAM and 512 PIDs and imposes a 180-second backstop. Test acceptance covered one worker and zero Swap; it does not enable limits in an existing production deployment.
+
 ### File Browser Root
 
 Open Terminal reports file-browser root metadata from `GET /files/cwd` so clients can hide parent navigation above a friendly starting point.
@@ -290,6 +304,8 @@ docker run -d --name open-terminal -p 8000:8000 \
 ```
 
 Each user automatically gets a dedicated Linux account with its own home directory, so files, commands, and terminals stay in their own workspace and users do not walk over each other's work. Standard Unix permissions keep the workspaces apart in day-to-day use. They do not protect users from each other, and they are not meant to.
+
+Notebook sessions belong to the `X-User-Id` and `X-Session-Id` values supplied when they are created. Use the same values to execute cells, check status, or stop a session. In multi-user mode, `X-User-Id` is required, notebook paths must stay within the user's home directory, and symbolic links are rejected. Kernels and notebook file operations run as that Linux user, with the notebook's directory as the kernel's working directory. In single-user mode, kernels and file operations use the service account and retain the existing filesystem access scope.
 
 ## API Docs
 
