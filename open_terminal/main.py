@@ -50,6 +50,11 @@ log = logging.getLogger(__name__)
 
 if MULTI_USER:
     from open_terminal.utils.user_isolation import check_environment, resolve_user
+    from open_terminal.utils.identity_store import (
+        IdentityConflictError,
+        IdentityStoreError,
+    )
+    from open_terminal.utils.user_isolation import ProvisioningError
     check_environment()
 
 if not API_KEY:
@@ -251,6 +256,29 @@ app.add_middleware(
 @app.exception_handler(PermissionError)
 async def permission_error_handler(request: Request, exc: PermissionError):
     return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
+if MULTI_USER:
+
+    @app.exception_handler(IdentityConflictError)
+    async def identity_conflict_error_handler(request: Request, exc: IdentityConflictError):
+        log.error("identity conflict on %s: %s", request.url.path, exc)
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+    @app.exception_handler(ProvisioningError)
+    async def provisioning_error_handler(request: Request, exc: ProvisioningError):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "User environment is being prepared. Retry shortly."},
+            headers={"Retry-After": "2"},
+        )
+
+
+    @app.exception_handler(IdentityStoreError)
+    async def identity_store_error_handler(request: Request, exc: IdentityStoreError):
+        log.error("identity store error on %s: %s", request.url.path, exc)
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.middleware("http")
