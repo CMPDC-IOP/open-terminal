@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.13.0] - 2026-09-13
+
+### Added
+
+- Assistants in Open WebUI can now use skills installed in your terminal's home folder. Requires Open WebUI 0.11.4.
+- Skills are loaded from the `.agents/skills`, `.cptr/skills`, `.claude/skills`, and `.codex/skills` folders. Skills with the same name appear only once.
+- Assistants can read each skill's instructions and see a list of its supporting files, including scripts and reference documents.
+
 ## [0.12.5] - 2026-09-08
 
 ### Added
