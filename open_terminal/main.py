@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import quote as url_quote
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +32,7 @@ from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_O
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner
 from open_terminal.utils.fs import UserFS
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
+from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
 
 MATCH_PAGE_SIZE = 100
 MAX_CONTENT_MATCHES_PER_FILE = 3
@@ -328,6 +330,19 @@ class ReplaceRequest(BaseModel):
     )
 
 
+class SkillSummary(BaseModel):
+    id: str
+    name: str
+    description: str
+    location: str
+    scope: str
+    source: str = "terminal"
+
+
+class SkillReadResponse(SkillSummary):
+    content: str
+    resources: list[str]
+
 
 # ---------------------------------------------------------------------------
 # Background process management
@@ -489,9 +504,45 @@ if OPEN_TERMINAL_INFO:
         return {"info": OPEN_TERMINAL_INFO}
 
 
+GLOBAL_SKILL_DIRS = (".agents/skills", ".cptr/skills", ".claude/skills", ".codex/skills")
+
+
+async def _list_skills_in_dir(fs: UserFS, root: str, scope: str) -> list[SkillSummary]:
+    if not await fs.isdir(root):
+        return []
+
+    skills: list[SkillSummary] = []
+    for entry in await fs.listdir(root):
+        dirname = str(entry.get("name") or "")
+        if entry.get("type") != "directory" or not dirname or dirname.startswith("."):
+            continue
+        skill_dir = join_skill_path(root, dirname)
+        skill_path = join_skill_path(skill_dir, "SKILL.md")
+        if not await fs.isfile(skill_path):
+            continue
+        frontmatter, _ = parse_skill_frontmatter(await fs.read_text(skill_path))
+        description = (frontmatter.get("description") or "").strip()
+        if not description:
+            continue
+        name = (frontmatter.get("name") or dirname).strip()
+        if not name:
+            continue
+        skills.append(
+            SkillSummary(
+                id=f"terminal:{url_quote(name, safe='')}",
+                name=name,
+                description=description[:1024],
+                location=skill_path,
+                scope=scope,
+            )
+        )
+    return skills
+
+
 # ---------------------------------------------------------------------------
 # Files
 # ---------------------------------------------------------------------------
+
 
 @app.get(
     "/files/cwd",
@@ -529,6 +580,62 @@ async def set_cwd(
         raise HTTPException(status_code=404, detail="Directory not found")
     _set_session_cwd(session_id, target)
     return {"cwd": target}
+
+
+@app.get(
+    "/skills",
+    response_model=list[SkillSummary],
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def list_skills(
+    http_request: Request,
+    fs: UserFS = Depends(get_filesystem),
+):
+    roots = [("global", join_skill_path(fs.home, path)) for path in GLOBAL_SKILL_DIRS]
+    seen_names: set[str] = set()
+    seen_roots: set[str] = set()
+    skills: list[SkillSummary] = []
+
+    for scope, root in roots:
+        root = os.path.normpath(root)
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        for skill in await _list_skills_in_dir(fs, root, scope):
+            if skill.name in seen_names:
+                continue
+            seen_names.add(skill.name)
+            skills.append(skill)
+
+    return skills
+
+
+@app.get(
+    "/skills/read",
+    response_model=SkillReadResponse,
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def read_skill(
+    http_request: Request,
+    name: str = Query(..., description="Skill name from /skills."),
+    fs: UserFS = Depends(get_filesystem),
+):
+    for skill in await list_skills(http_request, fs):
+        if skill.name != name:
+            continue
+
+        text = await fs.read_text(skill.location)
+        _frontmatter, body = parse_skill_frontmatter(text)
+        resources = await list_skill_resources(fs, os.path.dirname(skill.location))
+        return SkillReadResponse(
+            **skill.model_dump(),
+            resources=resources,
+            content=body,
+        )
+
+    raise HTTPException(status_code=404, detail="Skill not found")
 
 
 @app.get(
