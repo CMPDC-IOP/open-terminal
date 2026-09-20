@@ -1,5 +1,6 @@
 """Admission and lifetime contracts; resource values are controlled fixtures."""
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -130,6 +131,53 @@ def test_launch_keeps_user_env_out_of_privileged_interpreter(runtime, tmp_path):
         assert len(launch.kwargs["pass_fds"]) == 3
     finally:
         launch.abort()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "memfd_create"), reason="memfd_create requires Linux 3.17+"
+)
+def test_environment_backing_file_lives_off_filesystem(monkeypatch):
+    monkeypatch.setattr(
+        module.tempfile, "TemporaryFile",
+        Mock(side_effect=OSError(28, "No space left on device")),
+    )
+    file = module._environment_backing_file()
+    try:
+        file.write(b'{"PATH": "/usr/bin"}')
+        file.flush()
+        file.seek(0)
+        assert file.read() == b'{"PATH": "/usr/bin"}'
+        # A memfd keeps launch admission immune to a full shared /tmp.
+        assert os.readlink(f"/proc/self/fd/{file.fileno()}").startswith("/memfd:")
+    finally:
+        file.close()
+
+
+@pytest.mark.parametrize("blocked", ["missing", "error"])
+def test_environment_backing_file_falls_back_when_memfd_unavailable(
+    monkeypatch, blocked, tmp_path
+):
+    temporary_file = module.tempfile.TemporaryFile
+
+    def private_temporary_file(*, dir):
+        assert dir == "/run/open-terminal-execution"
+        return temporary_file(dir=tmp_path)
+
+    monkeypatch.setattr(module.tempfile, "TemporaryFile", private_temporary_file)
+    if blocked == "missing":
+        monkeypatch.delattr(os, "memfd_create", raising=False)
+    else:
+        monkeypatch.setattr(
+            os, "memfd_create", Mock(side_effect=OSError(38, "Function not implemented"))
+        )
+    file = module._environment_backing_file()
+    try:
+        file.write(b"{}")
+        file.flush()
+        file.seek(0)
+        assert file.read() == b"{}"
+    finally:
+        file.close()
 
 
 def test_cleanup_retains_budget_until_descendants_are_gone(runtime, tmp_path):

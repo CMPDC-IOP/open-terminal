@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- Cgroup launch bookkeeping no longer depends on the shared temporary directory. It uses an anonymous in-memory file, falling back to the existing private `/run/open-terminal-execution` directory when in-memory files are unavailable. This fixes helper startup failures affecting folder creation and file operations when `/tmp` is full; multipart upload buffering still requires temporary disk space.
+
 ## [0.14.0] - 2026-09-23
 
 ### Fixed

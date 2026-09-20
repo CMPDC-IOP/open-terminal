@@ -45,6 +45,28 @@ _SAFE_POPEN_OPTIONS = {
     "restore_signals",
 }
 _BASE_ENV = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+
+
+def _environment_backing_file():
+    """Anonymous memory file for the launch environment.
+
+    The launcher only reads this descriptor; it never needs a filesystem.
+    Prefer a memfd so admission cannot fail when the shared runtime temp
+    directory (often a small, user-shared tmpfs) is full or unavailable.
+    Restricted seccomp profiles may block memfd_create, hence the tempfile
+    fallback in the private directory created by initialize(), away from /tmp.
+    """
+    memfd_create = getattr(os, "memfd_create", None)
+    if memfd_create is not None:
+        try:
+            return os.fdopen(memfd_create("open-terminal-env", os.MFD_CLOEXEC), "r+b")
+        except OSError:
+            pass
+    return tempfile.TemporaryFile(  # noqa: SIM115 - owned across launch/cleanup
+        dir="/run/open-terminal-execution"
+    )
+
+
 _manager: Manager | None = None
 _initialization_lock = threading.Lock()
 _disconnect_check = ContextVar("execution_queue_disconnect", default=None)
@@ -531,7 +553,7 @@ class Launch:
             self._fds.extend((readfd, writefd))
             self._status_read = readfd
             self._status_write = writefd
-            self._environment_file = tempfile.TemporaryFile()  # noqa: SIM115 - owned across launch/cleanup
+            self._environment_file = _environment_backing_file()
             self._environment_file.write(json.dumps(environment).encode())
             self._environment_file.flush()
             self._environment_file.seek(0)
