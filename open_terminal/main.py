@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import io
 from importlib.metadata import version as _pkg_version
 import fnmatch
 import json
@@ -38,7 +39,7 @@ from open_terminal.utils.compute_environment import (
     with_compute_thread_defaults,
 )
 from open_terminal.utils.service_processes import HelpersBusy, run_helper
-from open_terminal.utils.fs import UserFS
+from open_terminal.utils.fs import UserFS, read_text_page
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
 from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
 from open_terminal.utils.idempotency import get_registry, run_creation
@@ -744,7 +745,7 @@ async def compare_files(http_request: Request, payload: CompareRequest, fs: User
     "/files/read",
     operation_id="read_file",
     summary="Read a file",
-    description="Read a file and return its contents. Supports text files and images (PNG, JPEG, WebP, etc.). For text files you can optionally request a specific line range. Images are returned as binary so you can view and analyze them directly. Use display_file to show a file to the user.",
+    description="Read a file. Text and extracted documents return at most 2,000 lines or 50 KiB of UTF-8 content per call, even with an explicit line range. When truncated is true, continue using next_start_line and next_start_column as start_line and start_column. Columns count Unicode characters, not bytes. Images are returned as binary. Use display_file to show a file to the user.",
     dependencies=[Depends(verify_api_key)],
     responses={
         404: {"description": "File not found."},
@@ -759,10 +760,16 @@ async def read_file(
         None, description="First line to return (1-indexed, inclusive). Defaults to the beginning of the file.", ge=1
     ),
     end_line: Optional[int] = Query(
-        None, description="Last line to return (1-indexed, inclusive). Defaults to the end of the file.", ge=1
+        None, description="Last line to return (1-indexed, inclusive). Defaults to the end of the file, subject to the 2,000-line and 50 KiB page limits.", ge=1
     ),
     fs: UserFS = Depends(get_filesystem),
+    start_column: int = Query(
+        1, description="First Unicode character in start_line (1-indexed). Use next_start_column to resume a long line.", ge=1
+    ),
 ):
+    start_line = start_line or 1
+    if end_line is not None and end_line < start_line:
+        raise HTTPException(status_code=400, detail="end_line must be greater than or equal to start_line")
     session_id = http_request.headers.get("x-session-id")
     session_cwd = _get_session_cwd(session_id, fs) if session_id else None
     target = fs.resolve_path(path, cwd=session_cwd)
@@ -770,12 +777,12 @@ async def read_file(
         raise HTTPException(status_code=404, detail="File not found")
 
     try:
-        content = await fs.read_text(target)
-        lines = content.splitlines(keepends=True)
-    except (UnicodeDecodeError, ValueError):
+        page = await fs.read_text_page(
+            target, start_line=start_line, end_line=end_line, start_column=start_column,
+        )
+    except UnicodeDecodeError:
         import mimetypes
 
-        raw = await fs.read(target)
         mime, _ = mimetypes.guess_type(target)
         mime = mime or "application/octet-stream"
 
@@ -787,32 +794,30 @@ async def read_file(
                 ext_suffix and target.lower().endswith(ext_suffix)
             ):
                 text = await asyncio.to_thread(extractor, target)
-                lines = text.splitlines(keepends=True)
-                start = (start_line or 1) - 1
-                end = end_line or len(lines)
-                return {
-                    "path": target,
-                    "total_lines": len(lines),
-                    "content": "".join(lines[start:end]),
-                }
+                try:
+                    page = await asyncio.to_thread(
+                        read_text_page, io.StringIO(text, newline=None),
+                        start_line=start_line, end_line=end_line, start_column=start_column,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                return {"path": target, **page}
 
         # Return raw binary for allowed mime type prefixes (e.g. image/*)
         if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
+            raw = await fs.read(target)
             return Response(content=raw, media_type=mime)
 
         # Other binary files: reject (LLMs can't interpret raw bytes)
+        size = (await fs.stat(target))["size"]
         raise HTTPException(
             status_code=415,
-            detail=f"Unsupported binary file type: {mime} ({len(raw)} bytes)",
+            detail=f"Unsupported binary file type: {mime} ({size} bytes)",
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    start = (start_line or 1) - 1
-    end = end_line or len(lines)
-    return {
-        "path": target,
-        "total_lines": len(lines),
-        "content": "".join(lines[start:end]),
-    }
+    return {"path": target, **page}
 
 
 @app.get(

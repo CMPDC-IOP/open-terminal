@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The `read_file` tool (`/files/read`) now returns bounded text pages (at most 2,000 lines or 50 KiB), including extracted documents and explicitly requested ranges. Responses report truncation and the next line/character position for lossless continuation through long lines. Plain text reads use bounded buffers instead of loading entire files into memory. Clients that need complete text must follow pagination.
 - Cgroup launch bookkeeping no longer depends on the shared temporary directory. It uses an anonymous in-memory file, falling back to the existing private `/run/open-terminal-execution` directory when in-memory files are unavailable. This fixes helper startup failures affecting folder creation and file operations when `/tmp` is full; multipart upload buffering still requires temporary disk space.
 
 ## [0.14.0] - 2026-09-23

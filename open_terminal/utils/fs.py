@@ -14,11 +14,19 @@ so that files belong to the provisioned user, not the server process.
 import asyncio
 import os
 import shutil
+from typing import TextIO
 
 import aiofiles
 import aiofiles.os
 
 from open_terminal.utils.service_processes import run_helper
+
+
+MAX_READ_LINES = 2000
+MAX_READ_BYTES = 50 * 1024
+READ_CHUNK_CHARS = 8192
+_LINE_ENDINGS = tuple("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+
 
 
 class UserFS:
@@ -157,6 +165,28 @@ class UserFS:
         async with aiofiles.open(path, "r", encoding=encoding, errors="strict") as f:
             return await f.read()
 
+    async def read_text_page(
+        self,
+        path: str,
+        *,
+        start_line: int = 1,
+        end_line: int | None = None,
+        start_column: int = 1,
+    ) -> dict:
+        """Return a bounded page without buffering the entire file or line."""
+        self._check_path(path)
+
+        def read_page():
+            with open(path, encoding="utf-8", errors="strict") as stream:
+                return read_text_page(
+                    stream,
+                    start_line=start_line,
+                    end_line=end_line,
+                    start_column=start_column,
+                )
+
+        return await asyncio.to_thread(read_page)
+
     async def exists(self, path: str) -> bool:
         """Check if *path* exists."""
         self._check_path(path)
@@ -290,3 +320,80 @@ class UserFS:
         self._check_path(destination)
         await asyncio.to_thread(shutil.move, source, destination)
         await self._chown(destination)
+
+
+def read_text_page(
+    stream: TextIO,
+    *,
+    start_line: int = 1,
+    end_line: int | None = None,
+    start_column: int = 1,
+    max_lines: int = MAX_READ_LINES,
+    max_bytes: int = MAX_READ_BYTES,
+) -> dict:
+    """Scan with bounded buffers, retaining at most one page of UTF-8 text.
+
+    Columns count Unicode characters, including the newline. Scanning past the
+    page keeps total_lines accurate and validates UTF-8 without loading the file.
+    Lines follow str.splitlines() semantics. Streams must normalize CRLF/CR
+    to LF, as the ordinary text reader does.
+    """
+    if max_lines < 1 or max_bytes < 4:
+        raise ValueError("Page limits must allow a line and any UTF-8 character")
+
+    last_line = start_line + max_lines - 1
+    if end_line is not None:
+        last_line = min(end_line, last_line)
+    line = column = 1
+    total_lines = 0
+    pieces: list[str] = []
+    output_bytes = 0
+    output_end_line = None
+    next_position = None
+    reason = None
+    start_found = start_column == 1
+
+    while buffer := stream.readline(READ_CHUNK_CHARS):
+        for chunk in buffer.splitlines(keepends=True):
+            total_lines = line
+            if line == start_line and column <= start_column < column + len(chunk):
+                start_found = True
+            if line >= start_line and next_position is None:
+                skip = max(0, start_column - column) if line == start_line else 0
+                selected = chunk[skip:]
+                if selected:
+                    if line > last_line:
+                        next_position = (line, column + skip)
+                        reason = "lines"
+                    else:
+                        encoded = selected.encode("utf-8")
+                        remaining = max_bytes - output_bytes
+                        prefix = encoded[:remaining].decode("utf-8", errors="ignore")
+                        if prefix:
+                            pieces.append(prefix)
+                            output_bytes += len(prefix.encode("utf-8"))
+                            output_end_line = line
+                        if len(encoded) > remaining:
+                            next_position = (line, column + skip + len(prefix))
+                            reason = "bytes"
+            if chunk.endswith(_LINE_ENDINGS):
+                line += 1
+                column = 1
+            else:
+                column += len(chunk)
+
+    if not start_found:
+        raise ValueError("start_column is beyond the requested line")
+
+    return {
+        "total_lines": total_lines,
+        "content": "".join(pieces),
+        "start_line": start_line,
+        "start_column": start_column,
+        "end_line": output_end_line,
+        "returned_bytes": output_bytes,
+        "truncated": next_position is not None,
+        "truncation_reason": reason,
+        "next_start_line": next_position[0] if next_position else None,
+        "next_start_column": next_position[1] if next_position else None,
+    }

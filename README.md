@@ -269,6 +269,19 @@ original file bytes.
 
 ## Using with Open WebUI
 
+The `read_file` tool (`GET /files/read`) returns text in pages of at most 2,000 lines or 50 KiB of
+UTF-8 content, including extracted document text. Explicit `start_line` and
+`end_line` ranges are subject to the same caps. If `truncated` is true, request
+the next page with `start_line=next_start_line` and
+`start_column=next_start_column`. Lines and columns are 1-indexed; columns count
+Unicode characters, allowing long lines to be read without loss. The original
+`path`, `total_lines`, and `content` fields remain available. `total_lines` is
+counted across the whole file using bounded buffers for plain text; document
+extractors may still load the document into memory. Images remain binary responses.
+
+Clients that need the complete text must read all pages before editing or
+saving. Downloads and raw previews can continue to use `/files/view`.
+
 Open Terminal integrates with [Open WebUI](https://github.com/open-webui/open-webui), giving your AI assistants the ability to run commands, manage files, and interact with a terminal right from the AI interface. Make sure to add it under **Open Terminal** in the integrations settings, not as a tool server. Adding it as an Open Terminal connection gives you a built-in file navigation sidebar where you can browse directories, upload, download, and edit files. There are two ways to connect:
 
 ### Direct Connection
