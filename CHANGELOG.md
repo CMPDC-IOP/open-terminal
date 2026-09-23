@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.14.0] - 2026-09-23
+
+### Fixed
+
+- Apps connecting to the MCP server over the network must now provide your Open Terminal API key. Previously, they could run commands and access files without providing the key. Connections with a missing or incorrect key are now rejected. If you had the MCP server enabled for network connections, update to the latest release.
+
 ## [0.13.0] - 2026-09-13
 
 ### Added
